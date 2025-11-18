@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import numpy as np
+import os
 from torch.optim import Adam
 from network import FeedForwardNN
 from torch.distributions import MultivariateNormal
@@ -22,9 +23,28 @@ class PPO:
         #initialize actor and critic networks
         self.actor = FeedForwardNN(self.obs_dim, self.act_dim)
         self.critic = FeedForwardNN(self.obs_dim, 1)
+        
+        # Initialize actor network to output reasonable default actions
+        # This helps with initial exploration - start with some throttle
+        for param in self.actor.parameters():
+            if len(param.shape) >= 2:
+                # Initialize weights with smaller values for more stable learning
+                torch.nn.init.xavier_uniform_(param, gain=0.5)
+            else:
+                # Initialize bias for throttle to be around 0.5 (moderate throttle)
+                # This ensures initial actions have some throttle, not all zeros
+                if param.shape[0] == self.act_dim:
+                    # Bias for output layer - set throttle bias to encourage initial movement
+                    param.data[1] = 0.5  # throttle bias (action[1]) - encourage initial throttle
 
-        #create a variable for matrix, 0.5 for stdev is arbitrary, used to generate the covariance matrix
-        self.cov_var = torch.full(size=(self.act_dim,), fill_value = 0.5)
+        #create a variable for matrix - variance for exploration
+        # Use different variances for steering vs throttle for better exploration
+        # Steering: higher variance (more exploration needed)
+        # Throttle: moderate variance (but ensure it explores positive values)
+        self.cov_var = torch.tensor([1.5, 0.8])  # [steering_var, throttle_var]
+        # Ensure we have the right shape
+        if len(self.cov_var) != self.act_dim:
+            self.cov_var = torch.full(size=(self.act_dim,), fill_value = 1.0)
 
         #create the covariance matrix, which will be used for multivariate norm distr
         self.cov_mat = torch.diag(self.cov_var)
@@ -32,16 +52,47 @@ class PPO:
         #backpropagate
         self.actor_optim = Adam(self.actor.parameters(), lr=self.lr)
         self.critic_optim = Adam(self.critic.parameters(), lr=self.lr)
+        
+        #model saving directory
+        self.save_dir = "models"
+        os.makedirs(self.save_dir, exist_ok=True)
 
     def get_action(self, obs):
         '''samples an action to create a multivariate normal distribution, using the mean found through the actor network inputting an observation. 
         samples an action from the distribution and its probability, returns it as a numpy array'''
         #convert observation to tensor if it's a numpy array
         if isinstance(obs, np.ndarray):
-            obs = torch.FloatTensor(obs)
+            obs = torch.from_numpy(obs).float()
+        elif not isinstance(obs, torch.Tensor):
+            # if it's neither numpy array nor tensor, try to convert
+            obs = torch.FloatTensor(np.array(obs, dtype=np.float32))
+        else:
+            # if it's already a tensor, ensure it's float
+            obs = obs.float()
+        
+        # ensure it's 1D (flatten if needed) and has correct shape
+        if obs.dim() > 1:
+            obs = obs.flatten()
+        elif obs.dim() == 0:
+            obs = obs.unsqueeze(0)
+        
+        # ensure it has the right number of dimensions for the network
+        if obs.dim() == 1:
+            obs = obs.unsqueeze(0)  # add batch dimension if needed
         
         #querying the neural network for a mean action
         mean = self.actor(obs)
+        
+        # remove batch dimension if we added it
+        if mean.dim() > 1:
+            mean = mean.squeeze(0)
+        
+        # Ensure mean actions are in reasonable range before sampling
+        # This helps prevent the network from outputting extreme values
+        # Steering: clip to [-2, 2] range (will be clipped to [-1, 1] later anyway)
+        # Throttle: ensure it's not too negative (we want positive throttle)
+        mean[0] = torch.clamp(mean[0], -2.0, 2.0)  # steering
+        mean[1] = torch.clamp(mean[1], -1.0, 2.0)  # throttle (allow some negative for exploration, but mostly positive)
         
         #create a multivariate normal distribution
         dist = MultivariateNormal(mean, self.cov_mat)
@@ -59,7 +110,7 @@ class PPO:
         return action_clipped.detach().cpu().numpy(), log_prob.detach()
     def _init_hyperparameters(self):
         #hyperparameters
-        self.lr = 0.003  #learning rate (reduced from 0.005 for stability)
+        self.lr = 0.001  #learning rate (reduced from 0.003 for more stable learning)
         self.gamma = 0.99  #discount factor
         self.lam = 0.95   #lambda for gae (currently not used, but kept for future GAE implementation)
         self.clip = 0.2  #clip parameter for ppo
@@ -67,7 +118,7 @@ class PPO:
         self.batch_size = 64   #mini-batch size (currently not used - full batch updates)
         self.timesteps_per_batch = 2048    #timesteps per batch
         self.n_updates_per_iteration = 5  #number of PPO update iterations per batch
-        self.max_timesteps_per_episode = 500  #max steps per episode (reduced for faster training on straight track)
+        self.max_timesteps_per_episode = 500  #max steps per episode (track is now 40 units, need more steps to reach finish)
 
     def rollout(self):
         batch_obs = []  #batch state/observations
@@ -135,7 +186,14 @@ class PPO:
         batch_rtgs = torch.tensor(batch_rtgs, dtype=torch.float)
         return batch_rtgs
 
-    def learn(self, total_timesteps):
+    def learn(self, total_timesteps, save_freq=10):
+        """
+        Train the PPO agent.
+        
+        Parameters:
+            total_timesteps: int - total number of timesteps to train
+            save_freq: int - save checkpoint every N iterations (0 to disable)
+        """
         t_so_far = 0 #timesteps simulated so far
         i_so_far = 0 #iterations so far
         
@@ -152,20 +210,42 @@ class PPO:
             #print training progress
             avg_ep_len = np.mean(batch_lens)
             avg_rew = np.mean([np.sum(ep_rews) for ep_rews in batch_rews])
+            max_ep_len = np.max(batch_lens)
+            
+            # Count how many episodes finished (reached finish line)
+            # We can't easily get this from batch data, but we can estimate from episode lengths
+            # Episodes that finish should be close to max_ep_len
+            finished_count = sum(1 for length in batch_lens if length >= max_ep_len * 0.8)
+            
+            # Calculate reward statistics
+            all_rewards = [r for ep_rews in batch_rews for r in ep_rews]
+            min_rew = np.min(all_rewards) if all_rewards else 0
+            max_rew = np.max(all_rewards) if all_rewards else 0
+            
             print(f"Iteration {i_so_far}: Timesteps={t_so_far}/{total_timesteps}, "
-                  f"Avg Episode Length={avg_ep_len:.1f}, Avg Reward={avg_rew:.2f}")
+                  f"Avg Episode Length={avg_ep_len:.1f}, Max={max_ep_len:.0f}, "
+                  f"Avg Reward={avg_rew:.2f} (min={min_rew:.2f}, max={max_rew:.2f}), "
+                  f"Episodes={len(batch_lens)}")
 
             #calculate advantage at the k-ith iteration
             A_k = batch_rtgs - V.detach()
 
-            #normalize advantage
-            A_k = (A_k-A_k.mean())/(A_k.std() + 1e-10)
+            #normalize advantage (only if std > 0 to avoid division issues)
+            if A_k.std() > 1e-8:
+                A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)
+            else:
+                # If all advantages are the same, set to zero (no learning signal)
+                A_k = A_k - A_k.mean()
 
             for _ in range(self.n_updates_per_iteration):
                 #this is to find pi_theta(a_t | s_t). we use the most current policy to represent it. also we get current v and logprobs
                 V, curr_log_probs = self.evaluate(batch_obs, batch_acts)
+                
                 #calculate the ratio, because both are log probs, we can do that by subtrating and then exponentiating the log out with e 
-                ratios = torch.exp(curr_log_probs - batch_log_probs)
+                # Clamp log_prob difference to prevent numerical instability
+                log_ratio = curr_log_probs - batch_log_probs
+                log_ratio = torch.clamp(log_ratio, min=-10, max=10)  # prevent extreme values
+                ratios = torch.exp(log_ratio)
 
                 #calculate surrogate losses. surr1 is not clipped, surr 2 is clipped, then you find the min one to make sure we step the least during 
                 #gradient ascent
@@ -177,31 +257,117 @@ class PPO:
                 #so good actions dont create too big of steps in gradient ascent but bad actions are penalized fully i think?
                 #now we backprop
 
-                
-
                 #calculate gradients and perform backprop for actor network
                 self.actor_optim.zero_grad()
                 actor_loss.backward(retain_graph=True)
+                # Gradient clipping for stability
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=0.5)
                 self.actor_optim.step()
 
                 critic_loss = nn.MSELoss()(V, batch_rtgs) #calculate MSE of predicted values and return (rewards-to-go) then backprop
                 self.critic_optim.zero_grad()
                 critic_loss.backward()
+                # Gradient clipping for stability
+                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=0.5)
                 self.critic_optim.step()
-
-
-
-
+            
+            # Save checkpoint periodically
+            if save_freq > 0 and i_so_far % save_freq == 0:
+                self.save(iteration=i_so_far)
+        
+        # Save final model
+        self.save(iteration=None)  # Save as final model
+        print(f"\nTraining completed! Final model saved.")
     
     def evaluate(self, batch_obs, batch_acts):
+        """
+        Evaluate the current policy on a batch of observations and actions.
+        Returns value estimates and log probabilities.
+        """
+        # Ensure batch_acts is a tensor
+        if isinstance(batch_acts, np.ndarray):
+            batch_acts = torch.from_numpy(batch_acts).float()
+        
         V = self.critic(batch_obs).squeeze() #queries critic network for a value V for every obs in batch_obs
+        
+        # Ensure V has correct shape
+        if V.dim() == 0:
+            V = V.unsqueeze(0)
+        elif V.dim() > 1:
+            V = V.squeeze()
 
-        #pretty sure this returns a random action
+        # Get mean action from actor
         mean = self.actor(batch_obs)
+        
+        # Ensure mean has correct shape (should match batch_acts)
+        if mean.dim() == 1 and batch_acts.dim() == 2:
+            # If batch_acts is 2D but mean is 1D, something is wrong
+            pass
+        elif mean.dim() == 2 and batch_acts.dim() == 1:
+            # If mean is 2D but batch_acts is 1D, squeeze mean
+            mean = mean.squeeze(0)
+        
         #get the multivariate norm distribution using that
         dist = MultivariateNormal(mean, self.cov_mat)
+        
         #get the log probabilities of all the batch actions from dist
         log_probs = dist.log_prob(batch_acts)
+        
+        # Ensure log_probs is 1D
+        if log_probs.dim() > 1:
+            log_probs = log_probs.squeeze()
+        elif log_probs.dim() == 0:
+            log_probs = log_probs.unsqueeze(0)
+            
         return V, log_probs
+    
+    def save(self, filepath=None, iteration=None):
+        """
+        Save the actor and critic networks.
+        
+        Parameters:
+            filepath: str - full path to save model (if None, uses default naming)
+            iteration: int - iteration number for checkpoint naming
+        """
+        if filepath is None:
+            if iteration is not None:
+                filepath = os.path.join(self.save_dir, f"ppo_model_iter_{iteration}.pth")
+            else:
+                filepath = os.path.join(self.save_dir, "ppo_model_final.pth")
+        
+        torch.save({
+            'actor_state_dict': self.actor.state_dict(),
+            'critic_state_dict': self.critic.state_dict(),
+            'actor_optimizer_state_dict': self.actor_optim.state_dict(),
+            'critic_optimizer_state_dict': self.critic_optim.state_dict(),
+            'obs_dim': self.obs_dim,
+            'act_dim': self.act_dim,
+            'hyperparameters': {
+                'lr': self.lr,
+                'gamma': self.gamma,
+                'clip': self.clip,
+            }
+        }, filepath)
+        print(f"Model saved to {filepath}")
+    
+    def load(self, filepath):
+        """
+        Load the actor and critic networks from a saved checkpoint.
+        
+        Parameters:
+            filepath: str - path to saved model file
+        """
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"Model file not found: {filepath}")
+        
+        checkpoint = torch.load(filepath, map_location='cpu')
+        
+        self.actor.load_state_dict(checkpoint['actor_state_dict'])
+        self.critic.load_state_dict(checkpoint['critic_state_dict'])
+        self.actor_optim.load_state_dict(checkpoint['actor_optimizer_state_dict'])
+        self.critic_optim.load_state_dict(checkpoint['critic_optimizer_state_dict'])
+        
+        print(f"Model loaded from {filepath}")
+        return checkpoint
        
 
