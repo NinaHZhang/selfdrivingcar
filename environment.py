@@ -337,18 +337,33 @@ class CatRacingEnv(gym.Env):
         
         reward = 0.0
         
-        # reward for moving forward
-        reward += speed * 0.1  # encourage speed
+        # Base reward for forward progress (encourages movement)
+        # Use forward speed (x-direction) as primary progress signal
+        forward_speed = max(0, speed)  # only reward positive forward speed
+        reward += forward_speed * 0.5  # increased from 0.1 to encourage movement
         
-        # penalty for being off-center
-        reward -= abs(center_offset) * 0.5  # encourage staying centered
+        # Reward for staying centered (smooth curve, higher reward when perfectly centered)
+        # Use exponential decay for better gradient near center
+        center_reward = 1.0 - (abs(center_offset) / (self.track_width / 2)) ** 2
+        reward += center_reward * 0.3
         
-        # big penalty for getting too close to walls
-        if left_dist < 0.5 or right_dist < 0.5:
-            reward -= 10.0
+        # Progressive penalty for being off-center (less harsh than before)
+        reward -= abs(center_offset) * 0.2  # reduced from 0.5
         
-        # small penalty for excessive steering (encourage smooth driving)
-        reward -= abs(steering) * 0.1
+        # Progressive penalty for getting close to walls (distance-based)
+        min_dist = min(left_dist, right_dist)
+        if min_dist < 1.0:  # within 1 unit of wall
+            # Penalty increases as you get closer
+            wall_penalty = (1.0 - min_dist) * 5.0  # max 5.0 when at wall
+            reward -= wall_penalty
+        
+        # Penalty for excessive steering (encourage smooth driving)
+        # Only penalize if steering is high relative to speed
+        if abs(steering) > 0.5:
+            reward -= abs(steering) * 0.05  # reduced penalty
+        
+        # Small bonus for maintaining consistent speed (encourages smooth driving)
+        # This will be more useful once we track previous speed
         
         return reward
     

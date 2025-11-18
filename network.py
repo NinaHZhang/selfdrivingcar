@@ -17,8 +17,10 @@ class FeedForwardNN(nn.Module):
         Return:
             None'''
         super(FeedForwardNN, self).__init__()
-        self.layer1 = nn.Linear(in_dim, 32) #32 neurons a layer instead of 64
-        self.layer2 = nn.Linear(32, out_dim)
+        # Increased network capacity for better learning
+        self.layer1 = nn.Linear(in_dim, 64)  # increased from 32 to 64
+        self.layer2 = nn.Linear(64, 64)  # added hidden layer
+        self.layer3 = nn.Linear(64, out_dim)
     
     def forward(self, obs):
         '''Runs a forward pass on the NN.
@@ -31,8 +33,9 @@ class FeedForwardNN(nn.Module):
         if isinstance(obs, np.ndarray):
             obs = torch.tensor(obs, dtype=torch.float)
         
-        activation1 = F.relu(self.layer1(obs)) # first layer with relu activation
-        output = self.layer2(activation1) #output layer with no activation
+        activation1 = F.relu(self.layer1(obs))  # first layer with relu activation
+        activation2 = F.relu(self.layer2(activation1))  # second hidden layer
+        output = self.layer3(activation2)  # output layer with no activation
 
         return output
 
