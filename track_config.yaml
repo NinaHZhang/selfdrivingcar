@@ -1,0 +1,7 @@
+track:
+  inner_radius: 10.0
+  outer_radius: 15.0
+  num_segments: 32
+  line_radius: 0.1
+  line_height: 0.5
+
