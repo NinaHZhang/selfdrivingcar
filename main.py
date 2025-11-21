@@ -26,6 +26,11 @@ def train_ppo(render=False, total_timesteps=100000, save_freq=10, load_model=Non
         print("Warning: No track seed set - track will be different each time!")
     env = CatRacingEnv(render=render, track_config_path="track_config.yaml",
                       track_seed=track_seed)
+    heading_idx = getattr(env, "heading_obs_index", None)
+    lateral_idx = getattr(env, "lateral_velocity_index", None)
+    num_look = getattr(env, "num_lookahead", 0)
+    curvature_start = 6
+    distance_start = curvature_start + num_look
     
     print("Initializing PPO agent...")
     try:
@@ -109,12 +114,27 @@ def test_agent(model_path=None, render=True, n_episodes=5, track_seed=None):
         print("Example: python main.py --mode test --model_path models/ppo_model_final.pth")
         return
     
+    # Set seeds for deterministic testing
+    import torch
+    import numpy as np
+    test_seed = 42  # Fixed seed for deterministic testing
+    torch.manual_seed(test_seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    np.random.seed(test_seed)
+    
     print("Creating environment...")
     print("Testing on full track")
     if track_seed is not None:
         print(f"Using track seed: {track_seed}")
     env = CatRacingEnv(render=render, track_config_path="track_config.yaml",
                       track_seed=track_seed)
+    
+    heading_idx = getattr(env, "heading_obs_index", None)
+    lateral_idx = getattr(env, "lateral_velocity_index", None)
+    num_look = getattr(env, "num_lookahead", 0)
+    curvature_start = 6
+    distance_start = curvature_start + num_look
     
     print("Initializing PPO agent...")
     model = PPO(env)
@@ -127,14 +147,15 @@ def test_agent(model_path=None, render=True, n_episodes=5, track_seed=None):
     print("-" * 50)
     
     for episode in range(n_episodes):
-        obs, info = env.reset()
+        # Use fixed seed for deterministic resets
+        obs, info = env.reset(seed=test_seed + episode)
         done = False
         total_reward = 0
         steps = 0
         
         while not done:
-            # Use stochastic actions during testing (temporarily enable exploration)
-            action, _ = model.get_action(obs, deterministic=False)
+            # Use deterministic actions for consistent, reproducible testing
+            action, _ = model.get_action(obs, deterministic=True)
             obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
             total_reward += reward
@@ -150,19 +171,18 @@ def test_agent(model_path=None, render=True, n_episodes=5, track_seed=None):
                 laps = info.get('laps_completed', 0)
                 progress_ratio = info.get('progress_ratio', 0)  # Normalized progress (0-1)
                 max_progress_ratio = info.get('max_progress_ratio', 0)  # Max progress reached
-                progress_abs = info.get('progress', 0)  # Absolute progress
-                max_progress_abs = info.get('max_progress', 0)  # Max absolute progress
-                
                 # Get observation values for more details
                 inner_dist = obs[0]
                 outer_dist = obs[1]
                 speed = obs[3]
-                heading = obs[8] if len(obs) > 8 else 0
+                heading = obs[heading_idx] if (heading_idx is not None and heading_idx < len(obs)) else 0
+                dist_profile = obs[distance_start:distance_start + num_look] if (num_look and distance_start + num_look <= len(obs)) else []
                 
                 print(f"  Step {steps}: Progress={progress_ratio*100:.1f}% (Max: {max_progress_ratio*100:.1f}%), "
                       f"Laps={laps}, Speed={speed:.2f}, "
                       f"WallDist={min(inner_dist, outer_dist):.2f}, "
                       f"Heading={heading*180/3.14159:.1f}°, "
+                      f"DistNear={dist_profile[0] if len(dist_profile)>0 else 0:.2f}, "
                       f"Reward={reward:.2f}")
         
         # Final episode summary

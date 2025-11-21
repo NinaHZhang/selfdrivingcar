@@ -6,6 +6,7 @@ from gymnasium import spaces
 import time
 import sys
 import importlib.util
+from collections import deque
 
 # Import the procedural track
 spec = importlib.util.spec_from_file_location("track", "track (1).py")
@@ -61,14 +62,24 @@ class CatRacingEnv(gym.Env):
             dtype=np.float32
         )
         
-        #define observation space: 9 values (added look-ahead features and heading)
+        # Look-ahead distances for multi-point preview
+        self.lookahead_distances = [2.0, 5.0, 10.0]  # meters ahead
+        self.action_history_len = 3  # store last N actions
+        
+        #define observation space: values include multi look-ahead, heading error, lateral velocity, action history
         # [inner_dist, outer_dist, lateral_offset, speed, steering, progress, 
-        #  curvature_ahead, distance_to_wall_ahead, heading]
+        #  curvature_near/mid/far, distance_near/mid/far, heading_error, lateral_velocity,
+        #  recent_actions (steering/throttle pairs)...]
+        self.num_lookahead = len(self.lookahead_distances)
+        self.observation_dim = 6 + self.num_lookahead * 2 + 2 + self.action_history_len * 2
+        self.heading_obs_index = 6 + self.num_lookahead * 2
+        self.lateral_velocity_index = self.heading_obs_index + 1
+        self.action_history_start_index = self.lateral_velocity_index + 1
         #because continous space, spaces.box says observations are within these ranges
         self.observation_space = spaces.Box(
             low = -np.inf,
             high = np.inf,
-            shape = (9,), #1d array with 9 values
+            shape = (self.observation_dim,),
             dtype=np.float32
         )
 
@@ -110,10 +121,13 @@ class CatRacingEnv(gym.Env):
         self.laps_completed = 0  # Number of full laps completed
         self.cumulative_forward_progress = 0.0  # Total forward progress made (for lap detection)
         self.last_valid_progress = 0.0  # Last valid progress position
-        self.min_translation_for_progress = 0.3  # minimum world displacement to count progress
+        self.min_translation_for_progress = 0.5  # minimum world displacement to count progress
         self.progress_diff_last = 0.0
         self.progress_diff_raw_last = 0.0
         self.progress_counted_last = False
+        self.action_history = deque(maxlen=self.action_history_len)
+        for _ in range(self.action_history_len):
+            self.action_history.append(np.zeros(2, dtype=np.float32))
         
         # Anti-spinning tracking
         self.last_positions = []  # Track recent positions to detect spinning
@@ -128,10 +142,16 @@ class CatRacingEnv(gym.Env):
         self.max_position_history = 20  # Keep last 20 positions
         self._last_10_progress = []  # Track recent progress values to detect spinning
         
-        # Spawn position: on the centerline, at the start (progress = 0)
-        spawn_point = self.centerline_points[0]
+        # Spawn position: on the centerline at the straightest part of the track
+        # This helps the agent start in an easier position (straight sections are easier than turns)
+        straightest_idx = self._find_straightest_point()
+        spawn_point = self.centerline_points[straightest_idx]
         self.spawn_x = spawn_point[0]
         self.spawn_y = spawn_point[1]
+        # Calculate progress at straightest point
+        self.spawn_progress = self.centerline_arc_lengths[straightest_idx]
+        # Store normalized spawn progress for lap detection (0-1)
+        self.normalized_spawn_progress = (self.spawn_progress % self.total_centerline_length) / self.total_centerline_length
         
         self._create_cat()
         self.last_valid_pos = np.array([self.spawn_x, self.spawn_y], dtype=np.float32)
@@ -146,6 +166,59 @@ class CatRacingEnv(gym.Env):
                 cameraPitch=-60,       # look down at track
                 cameraTargetPosition=[track_center[0], track_center[1], 0]  # center of track
             )
+    
+    def _find_straightest_point(self):
+        """
+        Find the straightest part of the track by computing curvature (angle changes).
+        Returns the index of the centerline point in the straightest segment.
+        """
+        centerline_xy = self.centerline_points[:, :2]
+        n = len(centerline_xy)
+        
+        # Calculate curvature (angle change) at each point
+        curvatures = np.zeros(n)
+        for i in range(n):
+            # Get three consecutive points to compute angle change
+            prev_point = centerline_xy[(i - 1) % n]
+            curr_point = centerline_xy[i]
+            next_point = centerline_xy[(i + 1) % n]
+            
+            # Compute vectors
+            vec1 = prev_point - curr_point
+            vec2 = next_point - curr_point
+            
+            # Normalize
+            norm1 = np.linalg.norm(vec1)
+            norm2 = np.linalg.norm(vec2)
+            
+            if norm1 > 1e-6 and norm2 > 1e-6:
+                vec1 = vec1 / norm1
+                vec2 = vec2 / norm2
+                
+                # Compute angle between vectors (curvature)
+                dot = np.clip(np.dot(vec1, vec2), -1.0, 1.0)
+                angle = np.arccos(dot)
+                curvatures[i] = angle
+            else:
+                curvatures[i] = np.pi  # High curvature if degenerate
+        
+        # Find the point with minimum curvature (straightest)
+        straightest_idx = np.argmin(curvatures)
+        return straightest_idx
+    
+    def _get_progress_relative_to_spawn(self, absolute_progress):
+        """
+        Calculate progress relative to spawn point (0-1, where 0 = spawn point, 1 = back to spawn).
+        
+        Parameters:
+            absolute_progress: float - absolute progress along centerline
+        
+        Returns:
+            float - progress relative to spawn point (0-1)
+        """
+        # Calculate relative progress: (current - spawn) mod total_length, normalized
+        relative = (absolute_progress - self.spawn_progress) % self.total_centerline_length
+        return relative / self.total_centerline_length
     
     def _compute_centerline_arc_lengths(self):
         """Precompute cumulative arc lengths along centerline for progress tracking."""
@@ -241,6 +314,22 @@ class CatRacingEnv(gym.Env):
         # Normal is perpendicular to tangent (rotate 90 degrees counterclockwise)
         return np.array([-tangent[1], tangent[0]])
 
+    def _get_centerline_point_at(self, progress):
+        """Interpolate a point on the centerline at the given progress."""
+        progress = progress % self.total_centerline_length
+        arc_lengths = self.centerline_arc_lengths
+        idx = np.searchsorted(arc_lengths, progress, side='right') - 1
+        idx = np.clip(idx, 0, len(self.centerline_points) - 1)
+        next_idx = (idx + 1) % len(self.centerline_points)
+        start_len = arc_lengths[idx]
+        end_len = arc_lengths[idx + 1] if idx + 1 < len(arc_lengths) else arc_lengths[-1]
+        if end_len <= start_len:
+            end_len = start_len + self.total_centerline_length
+        t = (progress - start_len) / (end_len - start_len + 1e-8)
+        start_point = self.centerline_points[idx, :2]
+        end_point = self.centerline_points[next_idx, :2]
+        return (1 - t) * start_point + t * end_point
+
     def _get_heading_from_orientation(self, orientation):
         """Convert quaternion orientation to normalized heading (yaw) angle."""
         yaw = p.getEulerFromQuaternion(orientation)[2]
@@ -270,9 +359,8 @@ class CatRacingEnv(gym.Env):
         """
         Create the car from URDF file with realistic wheel controls.
         """
-        # Spawn on centerline at start (progress = 0), facing along the track tangent
-        spawn_progress = 0.0
-        tangent = self._get_centerline_tangent(spawn_progress)
+        # Spawn on centerline, facing along the track tangent at spawn position
+        tangent = self._get_centerline_tangent(self.spawn_progress)
         initial_yaw = np.arctan2(tangent[1], tangent[0])  # Angle of tangent direction
         
         # Load URDF car with scaling to make it bigger relative to track
@@ -354,11 +442,6 @@ class CatRacingEnv(gym.Env):
     def _get_observation(self):
         """
         get the current observation (state) of the car for procedural track.
-        
-        returns:
-            observation - numpy array of 9 values:
-            [inner_dist, outer_dist, lateral_offset, speed, steering, progress,
-             curvature_ahead, min_dist_ahead, heading]
         """
         # get car's position and orientation
         pos, orn = p.getBasePositionAndOrientation(self.cat_id)
@@ -367,11 +450,9 @@ class CatRacingEnv(gym.Env):
         linear_vel, angular_vel = p.getBaseVelocity(self.cat_id)
         
         # extract useful values
-        x, y, z = pos
+        x, y, _ = pos
         car_pos_2d = np.array([x, y])
         
-        # Convert orientation quaternion to heading angle (yaw)
-        # Quaternion to Euler angles: [roll, pitch, yaw]
         heading = self._get_heading_from_orientation(orn)
         
         # Get progress along centerline
@@ -380,6 +461,8 @@ class CatRacingEnv(gym.Env):
         # Get centerline tangent and normal at this progress
         tangent = self._get_centerline_tangent(progress)
         normal = self._get_centerline_normal(progress)
+        track_heading = np.arctan2(tangent[1], tangent[0])
+        heading_error = self._angle_difference(heading, track_heading)
         
         # Find closest point on centerline
         closest_idx, _ = self._find_closest_centerline_point(car_pos_2d)
@@ -390,70 +473,59 @@ class CatRacingEnv(gym.Env):
         lateral_offset = np.dot(car_to_centerline, normal)  # positive = outside, negative = inside
         
         # Distance to inner and outer walls
-        # Inner wall is at -half_width, outer wall is at +half_width
         inner_dist = self.half_width + lateral_offset  # positive = outside inner wall
         outer_dist = self.half_width - lateral_offset  # positive = inside outer wall
         
-        # Calculate tangential speed (speed along the track)
+        # Calculate tangential and lateral speeds
         velocity_2d = np.array([linear_vel[0], linear_vel[1]])
-        speed = np.dot(velocity_2d, tangent)  # Project velocity onto tangent
+        tangential_speed = np.dot(velocity_2d, tangent)
+        lateral_velocity = np.dot(velocity_2d, normal)
         
         # steering/angular velocity (how fast turning)
-        steering = angular_vel[2]  # rotation around z-axis
+        steering_rate = angular_vel[2]  # rotation around z-axis
         
-        # Normalize progress to [0, 1] for observation (0 = start, 1 = one full lap)
-        normalized_progress = (progress % self.total_centerline_length) / self.total_centerline_length
+        # Normalize progress to [0, 1] for observation (relative to spawn point: 0 = spawn, 1 = back to spawn)
+        normalized_progress = self._get_progress_relative_to_spawn(progress)
         
-        # ===== LOOK-AHEAD FEATURES (help predict upcoming turns) =====
+        # ===== MULTI LOOK-AHEAD FEATURES =====
+        curvature_features = []
+        distance_features = []
+        car_forward_dir = tangent / (np.linalg.norm(tangent) + 1e-8)
         
-        # Look ahead along the track (predict upcoming curvature)
-        look_ahead_distance = 2.0  # Look 2 units ahead (adjust based on car speed)
-        look_ahead_progress = (progress + look_ahead_distance) % self.total_centerline_length
+        for dist_ahead in self.lookahead_distances:
+            look_progress = (progress + dist_ahead) % self.total_centerline_length
+            tangent_ahead = self._get_centerline_tangent(look_progress)
+            heading_ahead = np.arctan2(tangent_ahead[1], tangent_ahead[0])
+            curvature = self._angle_difference(heading_ahead, track_heading) / np.pi
+            curvature = np.clip(curvature, -1.0, 1.0)
+            curvature_features.append(curvature)
+            
+            look_pos = car_pos_2d + car_forward_dir * dist_ahead
+            centerline_point_ahead = self._get_centerline_point_at(look_progress)
+            normal_ahead = self._get_centerline_normal(look_progress)
+            car_to_centerline_ahead = look_pos - centerline_point_ahead
+            lateral_offset_ahead = np.dot(car_to_centerline_ahead, normal_ahead)
+            inner_dist_ahead = self.half_width + lateral_offset_ahead
+            outer_dist_ahead = self.half_width - lateral_offset_ahead
+            distance_features.append(min(inner_dist_ahead, outer_dist_ahead))
         
-        # Get tangent direction ahead
-        tangent_ahead = self._get_centerline_tangent(look_ahead_progress)
+        # Recent action history
+        action_hist_flat = np.array(self.action_history, dtype=np.float32).flatten()
         
-        # Calculate curvature (how much the track is turning)
-        # Curvature = change in tangent direction
-        curvature = np.arctan2(
-            tangent_ahead[1] - tangent[1],
-            tangent_ahead[0] - tangent[0]
-        )  # Angle difference between current and ahead tangent
-        # Normalize to [-1, 1] range
-        curvature = np.clip(curvature / np.pi, -1.0, 1.0)
-        
-        # Get minimum distance to walls ahead (predict if we'll hit a wall)
-        # Project car position forward along current direction
-        car_forward_dir = np.array([np.cos(np.arctan2(tangent[1], tangent[0])), 
-                                    np.sin(np.arctan2(tangent[1], tangent[0]))])
-        look_ahead_pos = car_pos_2d + car_forward_dir * look_ahead_distance
-        
-        # Find closest point on centerline ahead
-        closest_idx_ahead, _ = self._find_closest_centerline_point(look_ahead_pos)
-        centerline_point_ahead = self.centerline_points[closest_idx_ahead, :2]
-        normal_ahead = self._get_centerline_normal(look_ahead_progress)
-        
-        # Calculate lateral offset ahead
-        car_to_centerline_ahead = look_ahead_pos - centerline_point_ahead
-        lateral_offset_ahead = np.dot(car_to_centerline_ahead, normal_ahead)
-        
-        # Distance to walls ahead
-        inner_dist_ahead = self.half_width + lateral_offset_ahead
-        outer_dist_ahead = self.half_width - lateral_offset_ahead
-        min_dist_ahead = min(inner_dist_ahead, outer_dist_ahead)
-        
-        # return as numpy array
-        observation = np.array([
-            inner_dist,
-            outer_dist,
-            lateral_offset,
-            speed,
-            steering,
-            normalized_progress,
-            curvature,  # How much the track curves ahead
-            min_dist_ahead,  # Minimum distance to walls ahead
-            heading  # Car's heading angle (yaw) in radians, normalized to [-pi, pi]
-        ], dtype=np.float32)
+        observation = np.concatenate([
+            np.array([
+                inner_dist,
+                outer_dist,
+                lateral_offset,
+                tangential_speed,
+                steering_rate,
+                normalized_progress
+            ], dtype=np.float32),
+            np.array(curvature_features, dtype=np.float32),
+            np.array(distance_features, dtype=np.float32),
+            np.array([heading_error, lateral_velocity], dtype=np.float32),
+            action_hist_flat
+        ])
         
         return observation
 
@@ -497,16 +569,20 @@ class CatRacingEnv(gym.Env):
             p.stepSimulation()
         
         # reset centerline progress tracking
-        self.current_progress = 0.0
-        self.max_progress = 0.0
-        self.prev_progress = 0.0
+        # Initialize progress from spawn position (for seed 42, this will be at straightest point)
+        self.current_progress = self.spawn_progress
+        self.max_progress = self.spawn_progress
+        self.prev_progress = self.spawn_progress
         self.laps_completed = 0
         self.cumulative_forward_progress = 0.0
-        self.last_valid_progress = 0.0
+        self.last_valid_progress = self.spawn_progress
         self.last_valid_pos = np.array([self.spawn_x, self.spawn_y], dtype=np.float32)
         self.progress_diff_last = 0.0
         self.progress_diff_raw_last = 0.0
         self.progress_counted_last = False
+        self.action_history.clear()
+        for _ in range(self.action_history_len):
+            self.action_history.append(np.zeros(2, dtype=np.float32))
         
         # Reset anti-spinning tracking
         self.last_positions = []
@@ -539,6 +615,11 @@ class CatRacingEnv(gym.Env):
         # extract actions
         steering = action[0]  # -1 to 1
         throttle = action[1]  # 0 to 1
+        executed_action = np.array([
+            np.clip(steering, -1.0, 1.0),
+            np.clip(throttle, 0.0, 1.0)
+        ], dtype=np.float32)
+        self.action_history.append(executed_action)
         
         # store previous progress before updating (for reward calculation)
         self.prev_progress = self.current_progress
@@ -708,17 +789,23 @@ class CatRacingEnv(gym.Env):
                                    velocity_magnitude > 0.5 and  # Must be moving (increased from 0.2)
                                    not is_spinning)  # NOT spinning in circles
         
-        displacement = np.linalg.norm(car_pos_2d - self.last_valid_pos)
+        displacement_vec = car_pos_2d - self.last_valid_pos
+        displacement = np.linalg.norm(displacement_vec)
+        if displacement > 0:
+            disp_alignment = np.dot(displacement_vec / displacement, tangent)
+        else:
+            disp_alignment = 0.0
         progress_counted = False
 
-        if actual_forward_movement and displacement >= self.min_translation_for_progress:
+        movement_aligned = disp_alignment > 0.5  # at least roughly along tangent
+        if actual_forward_movement and displacement >= self.min_translation_for_progress and movement_aligned:
             # Valid forward progress - count it (sufficient translation)
             self.cumulative_forward_progress += progress_diff
             self.last_valid_progress = new_progress
             self.last_valid_pos = car_pos_2d.copy()
             progress_counted = True
-        elif actual_forward_movement and displacement < self.min_translation_for_progress:
-            # Treat as insufficient movement - do not count progress
+        elif actual_forward_movement and (displacement < self.min_translation_for_progress or not movement_aligned):
+            # Treat as insufficient movement or misaligned - do not count progress
             actual_forward_movement = False
         elif is_spinning:
             # SPINNING - reset cumulative progress to prevent false lap detection
@@ -730,17 +817,22 @@ class CatRacingEnv(gym.Env):
         # If progress_diff is large (>2% of track) or car isn't moving forward, ignore it (likely spinning)
         
         # Detect lap completion: MUST have cumulative forward progress >= 90% of track
-        # AND be near start line (to prevent false positives from spinning)
+        # AND be near spawn point (to prevent false positives from spinning)
         lap_just_completed = False
-        normalized_progress = (new_progress % self.total_centerline_length) / self.total_centerline_length
+        # Use relative progress (0 = spawn point, 1 = back to spawn)
+        relative_progress = self._get_progress_relative_to_spawn(new_progress)
         
         # Only count lap if we've actually moved forward 90%+ of the track length
         self.progress_counted_last = progress_counted
         self.progress_diff_raw_last = progress_diff
         self.progress_diff_last = progress_diff if progress_counted else 0.0
 
+        # Check if we're near the spawn point (relative progress near 0 or near 1)
+        spawn_tolerance = 0.15  # 15% tolerance
+        near_spawn = relative_progress < spawn_tolerance or relative_progress > (1.0 - spawn_tolerance)
+
         if (self.cumulative_forward_progress >= self.total_centerline_length * 0.9 and 
-            normalized_progress < 0.15):  # Near start line (within 15%)
+            near_spawn):  # Near spawn point (within 15%)
             # Valid lap completion - we actually moved forward around the track
             self.laps_completed += 1
             lap_just_completed = True
@@ -770,16 +862,16 @@ class CatRacingEnv(gym.Env):
         if terminated:
             reward -= 100.0  # Very large penalty for crashing
         
-        # extra info (normalize progress for display)
-        normalized_progress = (self.current_progress % self.total_centerline_length) / self.total_centerline_length
-        max_normalized_progress = (self.max_progress % self.total_centerline_length) / self.total_centerline_length
+        # extra info (normalize progress for display - relative to spawn point)
+        normalized_progress = self._get_progress_relative_to_spawn(self.current_progress)
+        max_normalized_progress = self._get_progress_relative_to_spawn(self.max_progress)
         
         info = {
             'progress': self.current_progress,
             'max_progress': self.max_progress,
             'laps_completed': self.laps_completed,
-            'progress_ratio': normalized_progress,  # normalized progress (0-1)
-            'max_progress_ratio': max_normalized_progress,  # normalized max progress (0-1)
+            'progress_ratio': normalized_progress,  # normalized progress (0-1) relative to spawn point
+            'max_progress_ratio': max_normalized_progress,  # normalized max progress (0-1) relative to spawn point
             'finished': terminated,
             'progress_counted': progress_counted,
             'progress_displacement': float(displacement),
@@ -793,52 +885,59 @@ class CatRacingEnv(gym.Env):
     
     def _calculate_reward(self, observation):
         """
-        Simplified reward function focused on track completion.
-        Continuous rewards for progress and speed, minimal competing signals.
+        Reward function emphasizing true forward progress, lane keeping, and stability.
         
         parameters:
-            observation - current state [inner_dist, outer_dist, lateral_offset, speed, steering, progress, curvature_ahead, min_dist_ahead, heading]
+            observation - current state vector (see _get_observation for layout)
         
         returns:
             reward - scalar reward value
         """
-        inner_dist, outer_dist, lateral_offset, speed, steering, normalized_progress, curvature_ahead, min_dist_ahead, heading = observation
+        num_look = self.num_lookahead
+        base_idx = 0
+        inner_dist = observation[base_idx]; base_idx += 1
+        outer_dist = observation[base_idx]; base_idx += 1
+        lateral_offset = observation[base_idx]; base_idx += 1
+        tangential_speed = observation[base_idx]; base_idx += 1
+        steering_rate = observation[base_idx]; base_idx += 1
+        normalized_progress = observation[base_idx]; base_idx += 1
+        curvature_feats = observation[base_idx:base_idx + num_look]; base_idx += num_look
+        distance_feats = observation[base_idx:base_idx + num_look]; base_idx += num_look
+        heading_error = observation[base_idx]; base_idx += 1
+        lateral_velocity = observation[base_idx]; base_idx += 1
+        action_hist = observation[base_idx:]
         
         reward = 0.0
         
         # ===== PRIMARY REWARD: Forward Progress (validated, continuous) =====
-        linear_vel, _ = p.getBaseVelocity(self.cat_id)
-        velocity_2d = np.array([linear_vel[0], linear_vel[1]])
-        velocity_magnitude = np.linalg.norm(velocity_2d)
-        tangent = self._get_centerline_tangent(self.current_progress)
-        forward_velocity = np.dot(velocity_2d, tangent)
-        _, angular_vel = p.getBaseVelocity(self.cat_id)
-        angular_velocity_magnitude = abs(angular_vel[2])
-        is_spinning = getattr(self, 'is_spinning_recent', False)
-        
         progress_step = self.progress_diff_last / self.total_centerline_length
         raw_progress_step = self.progress_diff_raw_last / self.total_centerline_length
+        is_spinning = getattr(self, 'is_spinning_recent', False)
         
         if self.progress_counted_last and progress_step > 0:
-            alignment = np.dot(velocity_2d, tangent) / (velocity_magnitude + 1e-6)
-            alignment = max(0.0, alignment)
-            reward += progress_step * 500.0 * alignment
+            alignment = max(0.0, 1.0 - abs(heading_error) / (np.pi / 2))
+            reward += progress_step * 100.0 * alignment
+            if alignment < 0.5:
+                reward -= 10.0
         else:
-            reward -= 1.0  # failed to make validated progress
+            reward -= 2.0  # failed to make validated progress
         
         if raw_progress_step < -1e-3:
-            reward -= abs(raw_progress_step) * 200.0
+            reward -= abs(raw_progress_step) * 300.0  # harsh penalty for backward motion
         
         if is_spinning:
             reward -= 50.0
         
         # Reward forward speed ONLY if moving forward and not spinning
-        if forward_velocity > 1.0 and not is_spinning:
-            reward += forward_velocity * 10.0
-        elif forward_velocity < -0.2:
-            reward += forward_velocity * 20.0
-        elif velocity_magnitude < 0.5 or is_spinning:
-            reward -= 2.0
+        if tangential_speed > 0.5 and not is_spinning and heading_error < np.pi/4:
+            reward += tangential_speed * 5.0
+        elif tangential_speed < -0.2:
+            reward += tangential_speed * 10.0
+        elif abs(tangential_speed) < 0.2 or is_spinning:
+            reward -= 1.0
+        
+        # Penalize lateral velocity (drifting)
+        reward -= abs(lateral_velocity) * 2.0
         
         # ===== CENTERING REWARD: Encourage staying in the middle of the track =====
         # Reward for being centered (lateral_offset close to 0)
@@ -858,13 +957,10 @@ class CatRacingEnv(gym.Env):
         # Progressive penalty as you get closer to walls (not just when very close)
         # This discourages wall tracing without being too harsh
         if min_dist < 0.5:  # Within 0.5 units of a wall
-            # Progressive penalty: -10.0 at 0.0 (touching wall), 0.0 at 0.5 (safe distance)
-            # Smooth curve so it's not too harsh
-            wall_penalty = -10.0 * (1.0 - min_dist / 0.5) ** 2  # Quadratic penalty (smoother)
+            wall_penalty = -15.0 * (1.0 - min_dist / 0.5) ** 2  # Stronger quadratic penalty
             reward += wall_penalty
         elif min_dist < 1.0:  # Within 1.0 units of a wall (warning zone)
-            # Small penalty to encourage staying away from walls
-            wall_penalty = -1.0 * (1.0 - min_dist / 1.0)  # Linear penalty: -1.0 at 0.5, 0.0 at 1.0
+            wall_penalty = -2.0 * (1.0 - min_dist / 1.0)
             reward += wall_penalty
         
         # Penalty for going off track (outside boundaries)
@@ -872,8 +968,8 @@ class CatRacingEnv(gym.Env):
             reward -= 20.0  # Stronger penalty for going off track (increased from 10.0)
         
         # Additional penalty if actually touching/colliding with wall
-        if min_dist < 0.1:  # Very close to wall (collision imminent)
-            reward -= 5.0  # Additional penalty for being too close
+        if min_dist < 0.05:  # Essentially touching wall
+            reward -= 25.0  # Strong penalty for wall contact
         
         # Note: Lap completion reward (+100) is handled in step() function after lap detection
         # This keeps the reward function focused on continuous progress
@@ -885,12 +981,18 @@ class CatRacingEnv(gym.Env):
         check if episode is done (car went off track, crashed, or completed lap).
         
         parameters:
-            observation - current state [inner_dist, outer_dist, lateral_offset, speed, steering, progress, curvature_ahead, min_dist_ahead, heading]
+            observation - current state vector
         
         returns:
             done - boolean
         """
-        inner_dist, outer_dist, lateral_offset, speed, steering, normalized_progress, curvature_ahead, min_dist_ahead, heading = observation
+        num_look = self.num_lookahead
+        inner_dist = observation[0]
+        outer_dist = observation[1]
+        lateral_offset = observation[2]
+        speed = observation[3]
+        steering = observation[4]
+        normalized_progress = observation[5]
         
         # SUCCESS: episode ends if car completes a lap (optional - can be success state)
         # For now, we'll let it continue after completing laps
@@ -931,7 +1033,9 @@ if __name__ == "__main__":
     
     obs, info = env.reset()
     print("Initial observation:", obs)
-    print("Observation format: [inner_dist, outer_dist, lateral_offset, speed, steering, progress, curvature_ahead, min_dist_ahead, heading]")
+    print("Observation format: [inner_dist, outer_dist, lateral_offset, tangential_speed, steering_rate, progress]"
+          " + curvature_near/mid/far + distance_near/mid/far + [heading_error, lateral_velocity]"
+          " + flattened recent actions")
     
     # take a few random steps with forward movement
     for i in range(1000):
@@ -947,11 +1051,13 @@ if __name__ == "__main__":
         # print every 10 steps to reduce output
         if i % 10 == 0:
             # get position from observation (new format for procedural track)
-            inner_dist, outer_dist, lateral_offset, speed, steering_vel, progress, curvature_ahead, min_dist_ahead, heading = obs
-            print(f"Step {i}: Progress={progress:.3f} ({progress*100:.1f}%), Speed={speed:.2f}, "
-                  f"Curvature={curvature_ahead:.2f}, DistAhead={min_dist_ahead:.2f}, "
-                  f"Laps={info['laps_completed']}, Reward={reward:.2f}, "
-                  f"Action=[{steering:.2f}, {throttle:.2f}], Terminated={terminated}")
+            num_look = env.num_lookahead
+            heading_error = obs[env.heading_obs_index]
+            dist_profile = obs[6 + num_look:6 + 2 * num_look]
+            print(f"Step {i}: Progress={info.get('progress_ratio',0)*100:.1f}%, "
+                  f"Speed={obs[3]:.2f}, HeadingErr={heading_error*180/np.pi:.1f}°, "
+                  f"DistNear={dist_profile[0]:.2f}, Laps={info.get('laps_completed',0)}, "
+                  f"Reward={reward:.2f}, Action=[{steering:.2f}, {throttle:.2f}], Terminated={terminated}")
 
         time.sleep(0.01)  # reduced sleep for faster testing
         

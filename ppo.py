@@ -126,15 +126,39 @@ class PPO:
         self.clip = 0.2  #clip parameter for ppo
         self.epochs = 10  #number of epochs per update (currently not used - full batch updates)
         self.batch_size = 64   #mini-batch size (currently not used - full batch updates)
-        self.timesteps_per_batch = 4096    #timesteps per batch (increased from 2048 for longer iterations)
+        self.timesteps_per_batch = 800    #timesteps per batch (will be adjusted dynamically based on progress)
         self.n_updates_per_iteration = 5  #number of PPO update iterations per batch
         self.max_timesteps_per_episode = 500  #max steps per episode (track is now 40 units, need more steps to reach finish)
 
         # Entropy/exploration schedule
         self.entropy_coef_start = 0.02   # initial entropy bonus
         self.entropy_coef_end = 0.001    # final entropy bonus
-        self.entropy_decay_iters = 150   # iterations over which to decay (longer training)
+        self.entropy_decay_iters = 50    # iterations over which to decay
         self.entropy_coef = self.entropy_coef_start
+
+    def _get_timesteps_per_batch(self, avg_progress):
+        """
+        Dynamically adjust timesteps per batch based on average progress.
+        Lower progress = shorter episodes (faster resets), higher progress = longer episodes.
+        
+        Parameters:
+            avg_progress: float - average progress ratio (0.0 to 1.0)
+        
+        Returns:
+            int - timesteps per batch
+        """
+        if avg_progress < 0.2:
+            # Can't get past 20% - keep short episodes
+            return 800
+        elif avg_progress < 0.5:
+            # Getting to 50% - medium episodes
+            return 1200
+        elif avg_progress < 0.8:
+            # Getting to 80% - longer episodes
+            return 1600
+        else:
+            # Completing laps - full length episodes
+            return 2000
 
     def rollout(self):
         batch_obs = []  #batch state/observations
@@ -251,10 +275,17 @@ class PPO:
             avg_laps = np.mean(batch_laps) if batch_laps else 0.0
             
             # Calculate progress statistics
-            avg_progress = np.mean(batch_max_progress) * 100 if batch_max_progress else 0.0  # Convert to percentage
+            avg_progress_ratio = np.mean(batch_max_progress) if batch_max_progress else 0.0  # Ratio (0-1)
+            avg_progress = avg_progress_ratio * 100  # Convert to percentage for display
             max_progress = max(batch_max_progress) * 100 if batch_max_progress else 0.0
             episodes_completing_50pct = sum(1 for p in batch_max_progress if p >= 0.5)
             episodes_completing_90pct = sum(1 for p in batch_max_progress if p >= 0.9)
+            
+            # Update timesteps per batch based on average progress (for next iteration)
+            new_timesteps = self._get_timesteps_per_batch(avg_progress_ratio)
+            if new_timesteps != self.timesteps_per_batch:
+                print(f"  Adjusting timesteps per batch: {self.timesteps_per_batch} -> {new_timesteps} (avg progress: {avg_progress:.1f}%)")
+                self.timesteps_per_batch = new_timesteps
             
             print(f"Iteration {i_so_far}: Timesteps={t_so_far}/{total_timesteps}, "
                   f"Avg Episode Length={avg_ep_len:.1f}, Max={max_ep_len:.0f}, "
